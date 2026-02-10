@@ -22,9 +22,7 @@ class NvidiaReranker(BasePassageReranker):
 		"""
 		super().__init__(project_dir)
 		self.api_key = kwargs.pop("api_key", None)
-		self.api_key = (
-			os.getenv("NVIDIA_API_KEY", None) if self.api_key is None else self.api_key
-		)
+		self.api_key = self.api_key or os.getenv("NVIDIA_API_KEY", None)
 		if self.api_key is None:
 			raise KeyError(
 				"Please set the API key for Nvidia rerank in the environment variable NVIDIA_API_KEY "
@@ -81,6 +79,12 @@ class NvidiaReranker(BasePassageReranker):
 		:param truncate: Optional truncation strategy for the API request
 		:return: Tuple of lists containing the reranked contents, ids, and scores
 		"""
+		if not (len(queries) == len(contents_list) == len(ids_list)):
+			raise AssertionError(
+				"NvidiaReranker input length mismatch. "
+				f"len(queries)={len(queries)}, len(contents_list)={len(contents_list)}, len(ids_list)={len(ids_list)}."
+			)
+
 		tasks = [
 			nvidia_rerank_pure(
 				self.session,
@@ -96,13 +100,16 @@ class NvidiaReranker(BasePassageReranker):
 		]
 		loop = get_event_loop()
 		results = loop.run_until_complete(process_batch(tasks, batch_size=batch))
+		if len(results) != len(queries):
+			raise AssertionError(
+				"NVIDIA rerank returned unexpected number of results. "
+				f"expected={len(queries)}, got={len(results)}. "
+				"Failing fast to prevent downstream index mapping errors."
+			)
 
-		content_result = list(map(lambda x: x[0], results))
-		id_result = list(map(lambda x: x[1], results))
-		score_result = list(map(lambda x: x[2], results))
+		content_result, id_result, score_result = zip(*results)
 
-		return content_result, id_result, score_result
-
+		return list(content_result), list(id_result), list(score_result)
 
 async def nvidia_rerank_pure(
 	session: aiohttp.ClientSession,
@@ -144,8 +151,18 @@ async def nvidia_rerank_pure(
 		response_body = await response.json()
 
 		rankings = response_body.get("rankings", [])
+		expected_len = len(documents)
+		if len(rankings) != expected_len:
+			raise AssertionError(
+				"NVIDIA rerank API returned unexpected rankings length. "
+				f"expected={expected_len}, got={len(rankings)}. "
+				"This can happen intermittently; failing fast to prevent index mapping errors."
+			)
 
 		def _score(item):
+			# According to the NVIDIA documentation, the output can be either 
+			# probability scores or raw logits depending on the configuration.
+			# So we check both fields to support various model settings.
 			if item.get("logit") is not None:
 				return float(item["logit"])
 			if item.get("score") is not None:
@@ -156,14 +173,8 @@ async def nvidia_rerank_pure(
 
 		top_rankings = rankings[:top_k]
 
-		reranked_contents = []
-		reranked_ids = []
-		reranked_scores = []
-
-		for item in top_rankings:
-			idx = item["index"]
-			reranked_contents.append(documents[idx])
-			reranked_ids.append(ids[idx])
-			reranked_scores.append(_score(item))
+		reranked_contents = [documents[item["index"]] for item in top_rankings]
+		reranked_ids      = [ids[item["index"]]       for item in top_rankings]
+		reranked_scores   = [_score(item)             for item in top_rankings]
 
 		return reranked_contents, reranked_ids, reranked_scores
